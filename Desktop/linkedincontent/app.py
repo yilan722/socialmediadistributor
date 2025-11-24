@@ -13,9 +13,9 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
 from docx.oxml.ns import qn
 
 # --- 全局配置 ---
-st.set_page_config(page_title="Pro Research Agent (1:1 Exact Copy)", layout="wide", page_icon="💎")
+st.set_page_config(page_title="Pro Research Agent (Final)", layout="wide", page_icon="💎")
 
-# 配置绘图风格
+# 配置绘图风格 (解决中文乱码和样式问题)
 plt.style.use('ggplot')
 plt.rcParams['font.family'] = 'sans-serif'
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial', 'DejaVu Sans', 'Microsoft YaHei'] 
@@ -30,23 +30,16 @@ if 'current_report' not in st.session_state:
 # --- 核心功能函数 ---
 
 def extract_pages_from_pdf(uploaded_file):
-    """
-    按页提取文本，而不是合并成一大坨。
-    这是保证表格不被打断、内容不丢失的关键。
-    """
+    """按页提取文本，保证表格结构不被切分"""
     pages_content = []
     with pdfplumber.open(uploaded_file) as pdf:
         for i, page in enumerate(pdf.pages):
             text = page.extract_text()
             if text:
-                # 标记页码，帮助 AI 理解上下文，但要求 AI 输出时去掉
                 pages_content.append(text)
     return pages_content
 
 def call_ai_api(api_key, base_url, model_name, messages, temperature=0.1, timeout=300):
-    """
-    温度设为 0.1，尽可能降低 AI 的创造性，强制它做“复读机”以保证内容精确。
-    """
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     payload = {"model": model_name, "messages": messages, "temperature": temperature, "stream": False}
     try:
@@ -54,7 +47,7 @@ def call_ai_api(api_key, base_url, model_name, messages, temperature=0.1, timeou
         if response.status_code == 200:
             return response.json()['choices'][0]['message']['content']
         else:
-            print(f"⚠️ API Error: {response.status_code} - {response.text}")
+            print(f"⚠️ API Error: {response.status_code}")
             return None 
     except Exception as e:
         print(f"⚠️ Connection Error: {e}")
@@ -62,88 +55,102 @@ def call_ai_api(api_key, base_url, model_name, messages, temperature=0.1, timeou
 
 def create_professional_table_image(markdown_table_lines):
     """
-    表格绘图引擎：保持原有逻辑，生成高质量表格图片
+    【修复版】表格绘图引擎：更强的容错性，确保输出图片
     """
     try:
+        # 1. 清洗数据，去除无关的分割线 (如 |---|)
         clean_rows = []
         for line in markdown_table_lines:
-            content = line.strip().strip('|')
-            # 过滤掉分割线行 (e.g. |---|---|)
-            if not content or set(content.replace('|', '').strip()) <= {'-', ':', ' '}:
+            content = line.strip()
+            if not content: continue
+            # 移除 Markdown 表格的分割行 (包含大量 - 或 :)
+            if set(content.replace('|', '').strip()) <= {'-', ':', ' '}:
                 continue
-            clean_rows.append(line)
+            clean_rows.append(content)
 
-        if len(clean_rows) < 2: return None
+        if len(clean_rows) < 2: return None # 至少要有表头和一行数据
         
-        headers = [h.strip() for h in clean_rows[0].split('|') if h.strip()]
-        if not headers: return None
+        # 2. 解析表头
+        headers = [h.strip() for h in clean_rows[0].strip('|').split('|')]
         
+        # 3. 解析数据行
         data = []
         row_heights = []
-        col_width_chars = 25
+        col_width_chars = 20 # 稍微调小换行宽度，防止图片过高
         
         for row_line in clean_rows[1:]:
-            raw_cells = [c.strip() for c in row_line.split('|') if c.strip() or c==""]
-            # 对齐列数
-            if len(raw_cells) > len(headers): raw_cells = raw_cells[:len(headers)]
-            if len(raw_cells) < len(headers): raw_cells += [""] * (len(headers) - len(raw_cells))
+            cells = [c.strip() for c in row_line.strip('|').split('|')]
             
+            # 对齐列数 (不足补空，多了截断)
+            if len(cells) < len(headers):
+                cells += [""] * (len(headers) - len(cells))
+            elif len(cells) > len(headers):
+                cells = cells[:len(headers)]
+                
             wrapped_row = []
-            max_lines_in_row = 1
-            
-            for cell_text in raw_cells:
-                wrapped_text = textwrap.fill(cell_text, width=col_width_chars, break_long_words=True)
-                wrapped_row.append(wrapped_text)
-                lines_count = wrapped_text.count('\n') + 1
-                if lines_count > max_lines_in_row:
-                    max_lines_in_row = lines_count
+            max_lines = 1
+            for cell_text in cells:
+                # 自动换行处理
+                wrapped = textwrap.fill(cell_text, width=col_width_chars)
+                wrapped_row.append(wrapped)
+                lines = wrapped.count('\n') + 1
+                if lines > max_lines: max_lines = lines
             
             data.append(wrapped_row)
-            row_heights.append(max_lines_in_row)
+            row_heights.append(max_lines)
 
         if not data: return None
-        
+
         df = pd.DataFrame(data, columns=headers)
 
-        base_row_height_inch = 0.45
-        header_height_inch = 0.6
-        total_data_height = sum([rh * base_row_height_inch for rh in row_heights])
-        fig_height = header_height_inch + total_data_height + 0.5 # 增加一点底部padding
-        fig_width = min(len(headers) * 2.8, 12) #稍微加宽
-        
-        fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+        # 4. 绘图计算
+        base_h = 0.5
+        header_h = 0.6
+        total_h = header_h + sum([rh * base_h for rh in row_heights]) + 0.5
+        # 动态宽度：列数越多越宽，但设上限
+        total_w = min(len(headers) * 3, 12) 
+
+        fig, ax = plt.subplots(figsize=(total_w, total_h))
         ax.axis('off')
         
-        table = ax.table(cellText=df.values, colLabels=df.columns, loc='center', cellLoc='center')
+        # 5. 生成表格
+        table = ax.table(cellText=df.values, colLabels=df.columns, loc='center', cellLoc='left')
+        
+        # 6. 美化样式
         table.auto_set_font_size(False)
         table.set_fontsize(11)
-        
         cells = table.get_celld()
+        
         for (row, col), cell in cells.items():
-            cell.set_edgecolor('#d0d0d0')
+            cell.set_edgecolor('#cccccc')
             cell.set_linewidth(0.5)
+            # 设置内边距
+            cell.set_text_props(position=(0.02, cell.get_text_props()['position'][1]))
+            
             if row == 0:
-                cell.set_height(header_height_inch / fig_height)
+                cell.set_height(header_h / total_h)
                 cell.set_facecolor('#2c3e50')
-                cell.set_text_props(color='white', weight='bold')
+                cell.set_text_props(color='white', weight='bold', ha='center')
             else:
-                height_multiplier = row_heights[row-1]
-                cell.set_height((height_multiplier * base_row_height_inch) / fig_height)
-                cell.set_facecolor('#f9f9f9' if row % 2 else '#ffffff')
-                cell.set_text_props(color='#333333', ha='left')
-                cell.set_text_props(position=(0.02, cell.get_text_props()['position'][1]))
+                rh_mult = row_heights[row-1]
+                cell.set_height((rh_mult * base_h) / total_h)
+                cell.set_facecolor('#f8f9fa' if row % 2 else '#ffffff')
+                cell.set_text_props(color='black', ha='left', wrap=True)
 
         img_buffer = io.BytesIO()
-        plt.savefig(img_buffer, format='png', bbox_inches='tight', pad_inches=0.05, dpi=300)
+        plt.savefig(img_buffer, format='png', bbox_inches='tight', pad_inches=0.1, dpi=300)
         plt.close(fig)
         img_buffer.seek(0)
         return img_buffer
 
     except Exception as e:
-        print(f"Table generation failed: {e}")
+        print(f"Table Gen Error: {e}")
         return None
 
 def generate_professional_word(content_text, model_name):
+    """
+    【修复版】Word 生成逻辑：确保最后一张表也能被写入
+    """
     doc = Document()
     style = doc.styles['Normal']
     font = style.font
@@ -153,16 +160,12 @@ def generate_professional_word(content_text, model_name):
     
     paragraph_format = style.paragraph_format
     paragraph_format.space_after = Pt(8)
-    paragraph_format.line_spacing_rule = WD_LINE_SPACING.MULTIPLE
     paragraph_format.line_spacing = 1.15
-    paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-
+    
+    # 标题
     head = doc.add_heading('Investment Research Report', 0)
     head.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    
-    meta = doc.add_paragraph(f"Original Content Transcribed by AI | {datetime.now().strftime('%Y-%m-%d')}")
-    meta.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-    meta.runs[0].font.color.rgb = RGBColor(100, 100, 100)
+    doc.add_paragraph(f"Generated by AI | {datetime.now().strftime('%Y-%m-%d')}", style='Normal').alignment = WD_ALIGN_PARAGRAPH.RIGHT
     doc.add_paragraph("_" * 50)
 
     lines = content_text.split('\n')
@@ -171,57 +174,56 @@ def generate_professional_word(content_text, model_name):
 
     for line in lines:
         stripped = line.strip()
-        # 判定表格行的逻辑优化：首尾有|，且中间也有|
-        is_table_row = stripped.startswith('|') and stripped.endswith('|') and '|' in stripped[1:-1]
+        
+        # 判定表格行：以 | 开头并以 | 结尾 (放宽中间内容的限制)
+        is_table_row = stripped.startswith('|') and stripped.endswith('|')
         
         if is_table_row:
             inside_table = True
             table_buffer.append(stripped)
         else:
             if inside_table:
-                # 表格结束，开始绘制
+                # 表格结束，立即处理缓冲区
                 img = create_professional_table_image(table_buffer)
-                if img: 
+                if img:
                     p = doc.add_paragraph()
                     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
                     run = p.add_run()
-                    run.add_picture(img, width=Inches(6.5)) # 加宽图片
-                # 即使画图失败，也把原始Markdown表格文本写入，防止数据丢失
+                    run.add_picture(img, width=Inches(6.5))
                 else:
+                    # 如果绘图失败，回退到文本模式，防止内容丢失
                     for tb_line in table_buffer:
                         doc.add_paragraph(tb_line, style='Normal')
                 
                 inside_table = False
                 table_buffer = []
-            
+
+            # 处理非表格内容
             if not stripped: continue
             
-            # 标题处理
             if stripped.startswith('# '): 
-                h = doc.add_heading(stripped.replace('#','').strip(), 1)
-                h.paragraph_format.space_before = Pt(18)
+                doc.add_heading(stripped.replace('#','').strip(), 1)
             elif stripped.startswith('## '): 
-                h = doc.add_heading(stripped.replace('#','').strip(), 2)
-                h.paragraph_format.space_before = Pt(12)
+                doc.add_heading(stripped.replace('#','').strip(), 2)
             elif stripped.startswith('### '): 
-                h = doc.add_heading(stripped.replace('#','').strip(), 3)
+                doc.add_heading(stripped.replace('#','').strip(), 3)
             elif stripped.startswith('- ') or stripped.startswith('* '): 
                 doc.add_paragraph(stripped[2:], style='List Bullet')
             else:
                 doc.add_paragraph(stripped)
 
-    # 处理文档末尾可能的表格
+    # 【关键修复】循环结束后，检查是否还遗留了一个表格在缓冲区
     if inside_table and table_buffer:
         img = create_professional_table_image(table_buffer)
-        if img: 
+        if img:
             p = doc.add_paragraph()
             p.alignment = WD_ALIGN_PARAGRAPH.CENTER
             run = p.add_run()
             run.add_picture(img, width=Inches(6.5))
         else:
-             for tb_line in table_buffer:
-                doc.add_paragraph(tb_line, style='Normal')
-    
+            for tb_line in table_buffer:
+                doc.add_paragraph(tb_line)
+
     bio = io.BytesIO()
     doc.save(bio)
     return bio
@@ -234,84 +236,82 @@ with st.sidebar:
             if st.button(f"Load: {item['time']}", key=f"hist_{i}"):
                 st.session_state['current_report'] = item
                 st.rerun()
-    
     st.divider()
-    # 默认 key 和 model，建议使用上下文窗口大的模型
     api_key = st.text_input("API Key", value="sk-3UIO8MwTblfyQuEZz2WUCzQOuK4QwwIPALVcNxFFNUxJayu7", type="password")
-    # 强力推荐使用 gemini-1.5-pro 或 gpt-4o 来处理复杂格式
-    model_name = st.selectbox("Model", ["gemini-3-pro", "gpt-4o", "qwen-max", "gemini-2.5-pro"])
+    model_name = st.selectbox("Model", ["gemini-3-pro", "gpt-4o", "qwen-max"])
 
 # --- 主界面 ---
-st.title("💎 Pro Research Agent (1:1 Perfect Copy)")
-st.markdown("**Mode: Exact Transcription (Table Preservation)**")
+st.title("💎 Pro Research Agent (Final Fixed)")
 
-uploaded_file = st.file_uploader("上传 PDF 资料 (建议使用原版PDF，非扫描件)", type=['pdf'])
+uploaded_file = st.file_uploader("上传 PDF", type=['pdf'])
 
 if uploaded_file and st.button("🔥 开始完美转化"):
     api_url = "https://api.nuwaapi.com/v1/chat/completions"
     
-    # 1. 解析 PDF (按页)
+    # 1. 逐页解析
     with st.spinner("📖 逐页读取 PDF..."):
         pages_list = extract_pages_from_pdf(uploaded_file)
-        st.toast(f"共识别到 {len(pages_list)} 页，开始逐页数字化...")
 
-    # 2. 数字化 (Page-by-Page Processing)
+    # 2. 1:1 数字化 (OCR模式)
     full_article_parts = []
     progress_bar = st.progress(0)
     status_text = st.empty()
     
     for i, page_text in enumerate(pages_list):
-        status_text.markdown(f"**🔄 正在处理第 {i+1}/{len(pages_list)} 页 (保留表格结构)...**")
+        status_text.markdown(f"**🔄 处理第 {i+1}/{len(pages_list)} 页 (表格重构中)...**")
         
-        # --- 核心 Prompt 修改：强制 OCR 模式 ---
         prompt = """
-        You are an advanced OCR and Formatting Engine. 
-        Your Goal: Convert the provided text into PERFECT Markdown.
-        
-        STRICT EXECUTION RULES:
-        1. **NO SUMMARIZATION**: You must output the text word-for-word. Do not delete any paragraphs.
-        2. **TABLES ARE SACRED**: 
-           - You MUST detect every table, even if it looks like a list.
-           - You MUST output them as valid Markdown Tables (using | header | ... and |---| separator).
-           - Do not skip numerical data.
-        3. **FORMATTING**: Use # for headers, ## for subheaders, - for lists.
-        4. **CLEANUP**: Remove page numbers like "Page 1 of 10" or footer dates.
-        
-        Input Text:
+        You are an advanced OCR Engine. 
+        Task: Transcribe the text exactly. 
+        Rules:
+        1. **Formatting**: Use Markdown (# Headers, - Lists).
+        2. **Tables**: DETECT TABLES and output them as standard Markdown tables (| Header |... |---|).
+        3. **Content**: No summarizing. Word-for-word exact match.
         """
+        msg = [{"role": "user", "content": f"{prompt}\n\nCONTENT:\n{page_text}"}]
         
-        msg = [{"role": "user", "content": f"{prompt}\n\n{page_text}"}]
+        res = call_ai_api(api_key, api_url, model_name, msg, temperature=0.1)
         
-        page_res = None
-        for attempt in range(3):
-            # Temperature = 0.1 确保精确复制
-            page_res = call_ai_api(api_key, api_url, model_name, msg, temperature=0.1)
-            if page_res: 
-                break
-            time.sleep(2)
-        
-        if page_res:
-            full_article_parts.append(page_res)
+        if res:
+            full_article_parts.append(res)
         else:
-            print(f"⚠️ Page {i+1} failed. Falling back to raw text.")
-            # 如果 AI 失败，用代码块包裹原始文本，提示用户手动处理
-            fallback_content = f"\n\n> **[Page {i+1} Raw Text]**\n```\n{page_text}\n```\n\n" 
-            full_article_parts.append(fallback_content)
+            full_article_parts.append(f"\n\n{page_text}\n\n") # 保底
             
         progress_bar.progress((i + 1) / len(pages_list))
 
     final_article = "\n\n".join(full_article_parts)
-    status_text.success("✅ 1:1 数字化完成！表格已重建。")
+    status_text.success("✅ 内容 1:1 提取完成")
 
-    # 3. 生成 Word
-    with st.spinner("💾 正在渲染专业 Word (含图表)..."):
+    # 3. 社媒生成 (恢复该功能)
+    with st.spinner("🧠 正在撰写深度社媒 (Lead Analyst Mode)..."):
+        social_prompt = """
+        Act as a Lead Analyst at a Hedge Fund. 
+        Write social media content based on the report provided.
+        **GOAL**: Sell the Logic, Catalysts, and Upside. 
+        **PLATFORMS**: 
+        1. LinkedIn (Professional, bullet points)
+        2. Twitter/X (Thread style, catchy)
+        3. Reddit (DD style, informal depth)
+        
+        Split platforms with '==='.
+        """
+        # 截取头尾以防 token 溢出，但保留核心
+        context = final_article[:8000] 
+        msg_social = [{"role": "user", "content": f"{social_prompt}\n\nREPORT:\n{context}"}]
+        social_res = call_ai_api(api_key, api_url, model_name, msg_social, temperature=0.7)
+        
+        if not social_res: social_res = "⚠️ 社媒生成超时，请重试。"
+
+    # 4. 生成 Word
+    with st.spinner("💾 正在渲染 Word (表格转图片)..."):
         word_bio = generate_professional_word(final_article, model_name)
 
-    # 4. 存档
+    # 5. 存档
     report_data = {
         "time": datetime.now().strftime("%H:%M"),
         "filename": uploaded_file.name,
         "article": final_article,
+        "social": social_res,
         "word_data": word_bio.getvalue()
     }
     st.session_state['current_report'] = report_data
@@ -323,28 +323,28 @@ current = st.session_state['current_report']
 
 if current:
     st.divider()
-    st.markdown(f"## 📊 交付结果: {current['filename']}")
+    st.markdown(f"## 📊 交付: {current['filename']}")
     
-    tab1, tab2 = st.tabs(["📥 Word 下载 & 预览", "📝 纯 Markdown (用于复制)"])
+    col1, col2 = st.columns([4, 6])
     
-    with tab1:
-        col1, col2 = st.columns([3, 7])
-        with col1:
-            st.info("👇 点击下载包含完美表格的 Word 文档")
-            st.download_button(
-                "📥 下载专业 Word 报告",
-                data=current['word_data'],
-                file_name=f"Pro_Report_{current['time']}.docx",
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-            )
-        with col2:
-            st.markdown("### 📄 渲染效果预览")
-            # 这里使用 st.markdown 渲染，可以看到表格效果
-            st.markdown(current['article'])
+    with col1:
+        st.subheader("📥 成果下载")
+        st.download_button(
+            "💾 下载 Word 报告 (含表格图片)",
+            data=current['word_data'],
+            file_name=f"Report_{current['time']}.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        )
+        st.divider()
+        st.subheader("📋 1:1 原始内容 (用于复制)")
+        st.info("👇 这是一个纯文本区域，你可以全选复制，粘贴到任何地方。它保留了所有文字和 Markdown 符号。")
+        # 【修改点】使用 text_area 而不是 code，方便普通复制
+        st.text_area("Original Content", value=current['article'], height=600)
 
-    with tab2:
-        st.warning("提示：点击右上角复制按钮，即可获得带格式的纯文本（含 Markdown 表格源码）")
-        st.code(current['article'], language="markdown")
+    with col2:
+        st.subheader("🔥 深度社媒文案 (已恢复)")
+        # 【修改点】社媒部分单独展示，高度自适应
+        st.text_area("Social Media Copy", value=current['social'], height=800)
 
 elif not uploaded_file:
-    st.info("👈 请上传 PDF 文件。本模式将开启‘OCR级’逐页精细处理，确保表格和全文内容 100% 完整。")
+    st.info("👈 请上传 PDF。本版本已强制修复表格图片生成和社媒文案逻辑。")
