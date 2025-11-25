@@ -3,30 +3,22 @@ import streamlit.components.v1 as components
 import requests
 import pdfplumber
 import io
+import re
 import textwrap
 import pandas as pd
 import matplotlib.pyplot as plt
 import base64
-from datetime import datetime
 from docx import Document
-from docx.shared import Inches, Pt
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.oxml.ns import qn
+from docx.shared import Inches
 
 # --- 全局配置 ---
-st.set_page_config(page_title="Pro Research (Copy Button Fixed)", layout="wide", page_icon="💎")
+st.set_page_config(page_title="Pro Research (Image Table Fixed)", layout="wide", page_icon="💎")
 
-# 绘图配置 (解决中文乱码)
+# 绘图配置
 plt.style.use('ggplot')
 plt.rcParams['font.family'] = 'sans-serif'
-plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial', 'Microsoft YaHei', 'DejaVu Sans'] 
+plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial', 'Microsoft YaHei'] 
 plt.rcParams['axes.unicode_minus'] = False
-
-# --- 状态管理 ---
-if 'history' not in st.session_state:
-    st.session_state['history'] = []
-if 'current_report' not in st.session_state:
-    st.session_state['current_report'] = None
 
 # --- 核心函数 ---
 
@@ -41,7 +33,7 @@ def extract_text(uploaded_file):
 def call_ai(api_key, model, messages):
     url = "https://api.nuwaapi.com/v1/chat/completions"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    payload = {"model": model, "messages": messages, "temperature": 0.1, "stream": False}
+    payload = {"model": model, "messages": messages, "temperature": 0.1}
     try:
         res = requests.post(url, headers=headers, json=payload, timeout=120)
         if res.status_code == 200:
@@ -49,257 +41,299 @@ def call_ai(api_key, model, messages):
         return None
     except: return None
 
-def fig_to_base64(fig):
-    """把 matplotlib 图片转为 base64 字符串"""
-    buf = io.BytesIO()
-    fig.savefig(buf, format='png', bbox_inches='tight', dpi=150, pad_inches=0.1)
-    plt.close(fig)
-    buf.seek(0)
-    return base64.b64encode(buf.getvalue()).decode()
-
-def create_table_img_b64(markdown_lines):
+def generate_table_image_base64(table_text):
     """
-    强制把 list 转换为图片 Base64
+    将文本内容强制绘制成表格图片，返回 Base64 字符串
     """
     try:
-        # 1. 清洗
-        clean_rows = [line.strip() for line in markdown_lines if '|' in line and not set(line.strip()) <= {'|', '-', ':', ' '}]
-        if len(clean_rows) < 1: return None
-        
-        # 2. 解析
+        # 1. 预处理：按行分割，按竖线或两空格分割
+        lines = table_text.strip().split('\n')
         data = []
-        max_cols = 0
-        for line in clean_rows:
-            cells = [c.strip() for c in line.strip('|').split('|')]
-            data.append(cells)
-            max_cols = max(max_cols, len(cells))
-            
-        if not data: return None
         
-        # 补齐
+        # 尝试解析 Markdown 表格
+        for line in lines:
+            line = line.strip()
+            if not line: continue
+            # 过滤分割线 |---|
+            if set(line.replace('|','').replace('-','').replace(' ','')) == set():
+                continue
+            
+            # 拆分单元格
+            if '|' in line:
+                cells = [c.strip() for c in line.split('|') if c.strip() != '']
+            else:
+                # 如果没有竖线，尝试用多个空格拆分
+                cells = [c.strip() for c in re.split(r'\s{2,}', line) if c.strip()]
+            
+            if cells:
+                data.append(cells)
+
+        if not data: return None
+
+        # 补齐列数
+        max_cols = max(len(row) for row in data)
         final_data = [row + [""]*(max_cols-len(row)) for row in data]
         
+        # 分离表头
         headers = final_data[0]
         body = final_data[1:]
-        if not body: body = [[""]*len(headers)]
-        
-        # 3. 绘图
+        if not body: body = [[""]*len(headers)] # 防止只有表头
+
+        # 2. 绘图
         df = pd.DataFrame(body, columns=headers)
         
-        # 动态高度
+        # 计算动态行高
         row_heights = []
-        col_width = 25
+        col_width = 20
         for row in body:
-            mh = 1
-            for c in row:
-                mh = max(mh, len(textwrap.wrap(str(c), width=col_width)))
-            row_heights.append(mh)
-            
-        total_h = 0.8 + sum([h*0.45 for h in row_heights])
-        total_w = min(len(headers)*3, 12)
-        
+            max_lines = 1
+            for item in row:
+                # 估算换行
+                lines_count = len(textwrap.wrap(str(item), width=col_width))
+                if lines_count > max_lines: max_lines = lines_count
+            row_heights.append(max_lines)
+
+        # 图片尺寸
+        base_h = 0.5
+        total_h = 1.0 + sum([rh * base_h for rh in row_heights])
+        total_w = min(len(headers) * 3, 14)
+
         fig, ax = plt.subplots(figsize=(total_w, total_h))
         ax.axis('off')
         
+        # 绘制
         table = ax.table(cellText=df.values, colLabels=df.columns, loc='center', cellLoc='left')
         table.auto_set_font_size(False)
-        table.set_fontsize(11)
+        table.set_fontsize(12)
         
-        # 样式
+        # 美化
         cells = table.get_celld()
         for (row, col), cell in cells.items():
-            cell.set_edgecolor('#cccccc')
             cell.set_linewidth(1)
-            cell.set_text_props(position=(0.02, cell.get_text_props()['position'][1]))
+            cell.set_edgecolor('#a0a0a0')
+            cell.set_text_props(position=(0.02, cell.get_text_props()['position'][1])) # padding
+            
             if row == 0:
-                cell.set_facecolor('#2c3e50')
+                cell.set_facecolor('#404040')
                 cell.set_text_props(color='white', weight='bold', ha='center')
+                cell.set_height(0.8/total_h)
             else:
-                cell.set_facecolor('#f9f9f9' if row%2 else 'white')
+                cell.set_facecolor('#f5f5f5' if row % 2 else 'white')
                 cell.set_text_props(color='black', wrap=True)
-                
-        return fig_to_base64(fig)
+                rh = row_heights[row-1]
+                cell.set_height((rh * base_h)/total_h)
+
+        # 保存
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', bbox_inches='tight', dpi=150, pad_inches=0.1)
+        plt.close(fig)
+        buf.seek(0)
+        return base64.b64encode(buf.getvalue()).decode()
+
     except Exception as e:
-        print(f"Table Error: {e}")
+        print(f"Table Gen Error: {e}")
         return None
 
-def process_content_to_html(text):
+def process_text_to_html_blocks(full_text):
     """
-    将文本转为 HTML，表格强制转为 Base64 图片
+    核心解析逻辑：
+    1. 找到 [[TABLE_START]] ... [[TABLE_END]]
+    2. 将中间内容转图片
+    3. 其他内容保留格式
     """
-    lines = text.split('\n')
-    html_out = """<div id="content-to-copy" style="font-family: Arial; padding: 20px; color: #333;">"""
+    # 正则分割：保留分隔符以便知道哪里是表格
+    # pattern 匹配 [[TABLE_START]] (内容) [[TABLE_END]]
+    pattern = re.compile(r'(\[\[TABLE_START\]\][\s\S]*?\[\[TABLE_END\]\])')
     
-    table_buffer = []
-    inside_table = False
+    parts = pattern.split(full_text)
     
-    for line in lines:
-        stripped = line.strip()
-        # 只要包含 | 就认为是表格的一部分
-        is_table_row = '|' in stripped
+    html_out = """<div id="copy-content" style="font-family: 'Arial', sans-serif; line-height: 1.6; color: #333;">"""
+    
+    for part in parts:
+        if "[[TABLE_START]]" in part:
+            # === 这是一个表格区域 ===
+            # 提取纯文本内容
+            raw_table = part.replace("[[TABLE_START]]", "").replace("[[TABLE_END]]", "").strip()
+            
+            # 生成图片 Base64
+            img_b64 = generate_table_image_base64(raw_table)
+            
+            if img_b64:
+                # 插入图片
+                html_out += f"""
+                <div style="margin: 20px 0; text-align: center;">
+                    <img src="data:image/png;base64,{img_b64}" style="max-width: 100%; border: 1px solid #ccc; box-shadow: 2px 2px 5px rgba(0,0,0,0.1);">
+                </div>
+                """
+            else:
+                # 失败回退
+                html_out += f"<pre style='background:#f4f4f4; padding:10px;'>{raw_table}</pre>"
         
-        if is_table_row:
-            inside_table = True
-            table_buffer.append(stripped)
         else:
-            if inside_table:
-                # 结束表格，生成图片
-                b64 = create_table_img_b64(table_buffer)
-                if b64:
-                    html_out += f'<br><img src="data:image/png;base64,{b64}" style="max-width:100%; border:1px solid #ddd;" /><br>'
-                else:
-                    # 如果生成图片失败，回退到文本
-                    for tb in table_buffer:
-                         html_out += f"<p>{tb}</p>"
-                inside_table = False
-                table_buffer = []
-            
-            # 处理普通文本
-            if stripped.startswith('# '): html_out += f"<h1>{stripped[2:]}</h1>"
-            elif stripped.startswith('## '): html_out += f"<h2>{stripped[3:]}</h2>"
-            elif stripped.startswith('### '): html_out += f"<h3>{stripped[4:]}</h3>"
-            elif stripped.startswith('- '): html_out += f"<li>{stripped[2:]}</li>"
-            elif stripped: html_out += f"<p>{stripped}</p>"
-            
-    # 处理末尾残留表格
-    if inside_table and table_buffer:
-        b64 = create_table_img_b64(table_buffer)
-        if b64:
-             html_out += f'<br><img src="data:image/png;base64,{b64}" style="max-width:100%; border:1px solid #ddd;" /><br>'
-    
+            # === 这是普通文本区域 ===
+            # 简单格式化
+            lines = part.split('\n')
+            for line in lines:
+                s = line.strip()
+                if not s: continue
+                
+                if s.startswith('### '): html_out += f"<h3 style='margin-top:15px; color:#444;'>{s[4:]}</h3>"
+                elif s.startswith('## '): html_out += f"<h2 style='border-bottom:2px solid #eee; padding-bottom:5px;'>{s[3:]}</h2>"
+                elif s.startswith('# '): html_out += f"<h1 style='color:#222;'>{s[2:]}</h1>"
+                elif s.startswith('- ') or s.startswith('* '): html_out += f"<li style='margin-left:20px;'>{s[2:]}</li>"
+                else: html_out += f"<p style='margin-bottom:10px;'>{s}</p>"
+                
     html_out += "</div>"
     return html_out
 
-def generate_word_doc(html_content):
-    """为了 Word 下载功能简单生成一个 docx"""
-    doc = Document()
-    doc.add_paragraph("Please use the 'Copy' button on the left to copy rich text with images.")
-    # 这里只是占位，因为用户主要需求是复制
-    bio = io.BytesIO()
-    doc.save(bio)
-    return bio
-
 # --- UI ---
-
 with st.sidebar:
     api_key = st.text_input("API Key", value="sk-3UIO8MwTblfyQuEZz2WUCzQOuK4QwwIPALVcNxFFNUxJayu7", type="password")
     model_name = st.selectbox("Model", ["gemini-3-pro", "gpt-4o"])
 
-st.title("💎 Pro Research (JS Copy Engine)")
+st.title("💎 Pro Research: 1:1 PDF Converter")
+st.markdown("Feature: **PDF Tables -> Real Images** | **Text -> Editable Text**")
 
-uploaded_file = st.file_uploader("上传 PDF", type=['pdf'])
+uploaded_file = st.file_uploader("Upload PDF", type=['pdf'])
 
-if uploaded_file and st.button("🚀 生成"):
+if uploaded_file and st.button("🚀 Start Conversion"):
     api_url = "https://api.nuwaapi.com/v1/chat/completions"
     
-    with st.spinner("1. 读取 PDF..."):
+    with st.spinner("1. Reading PDF..."):
         raw_text = extract_text(uploaded_file)
         
     chunks = [raw_text[i:i+4000] for i in range(0, len(raw_text), 4000)]
-    full_md = []
+    full_res = []
     
     progress = st.progress(0)
     for i, chunk in enumerate(chunks):
-        with st.spinner(f"2. 数字化 Part {i+1}/{len(chunks)}..."):
-            # 强制 AI 输出 Markdown 表格
-            prompt = "OCR Task. Output EXACT text. Detect TABLES and format as Markdown (| col |...)."
-            msg = [{"role": "user", "content": f"{prompt}\n\n{chunk}"}]
+        with st.spinner(f"2. Processing Part {i+1}/{len(chunks)}..."):
+            # === 核心 Prompt：强制标签 ===
+            prompt = """
+            You are a format conversion engine.
+            Task: Convert PDF text to Markdown.
+            
+            CRITICAL RULES FOR TABLES:
+            1. Whenever you encounter a table (data with rows and columns), you MUST wrap it in tags:
+               [[TABLE_START]]
+               ... table content (keep logic, can be | separated or just aligned) ...
+               [[TABLE_END]]
+               
+            2. For all other text: Output exactly as is (1:1 copy).
+            3. Do not summarize.
+            """
+            msg = [{"role": "user", "content": f"{prompt}\n\nCONTENT:\n{chunk}"}]
             res = call_ai(api_key, model_name, msg)
-            full_md.append(res if res else chunk)
+            full_res.append(res if res else chunk)
         progress.progress((i+1)/len(chunks))
         
-    full_text = "\n\n".join(full_md)
+    full_converted_text = "\n".join(full_res)
     
-    with st.spinner("3. 渲染图片与 HTML..."):
-        # 核心：生成包含 Base64 图片的 HTML 字符串
-        final_html = process_content_to_html(full_text)
-        
-    with st.spinner("4. 撰写社媒..."):
-        msg_s = [{"role": "user", "content": f"Write social media posts based on:\n{full_text[:5000]}"}]
-        social = call_ai(api_key, model_name, msg_s)
+    with st.spinner("3. Rendering Images & Generating Copy-Ready View..."):
+        # 生成带图片的 HTML
+        final_html = process_text_to_html_blocks(full_converted_text)
 
-    st.session_state['current_report'] = {
-        "html": final_html,
-        "social": social,
-        "filename": uploaded_file.name
-    }
+    # 存入 Session
+    st.session_state['result'] = final_html
     st.rerun()
 
 # --- 结果展示 ---
-curr = st.session_state['current_report']
-if curr:
+if 'result' in st.session_state:
     st.divider()
-    col1, col2 = st.columns([6, 4])
+    
+    # CSS 样式：定义复制按钮和显示区域
+    st.markdown("""
+    <style>
+    .copy-container {
+        position: relative;
+    }
+    .main-btn {
+        background-color: #00C853; 
+        color: white; 
+        padding: 12px 24px; 
+        border: none; 
+        border-radius: 5px; 
+        font-size: 16px; 
+        cursor: pointer; 
+        width: 100%;
+        margin-bottom: 10px;
+        font-weight: bold;
+    }
+    .main-btn:hover { background-color: #00E676; }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    col1, col2 = st.columns([2, 8])
     
     with col1:
-        st.subheader("📋 原始内容 (图文版)")
+        st.info("👈 点击右侧绿色按钮，即可将【包含图片表格】的完整内容复制到剪贴板。")
+        st.warning("如果图片未显示，请检查 API 模型是否正确识别了表格。")
+
+    with col2:
+        # === 核心 JS 组件：一键复制 ===
+        html_content = st.session_state['result']
         
-        # --- 核心：JS 一键复制组件 ---
-        # 我们注入一段 HTML+JS。
-        # 1. 隐藏的 div 存放内容。
-        # 2. 一个漂亮的按钮。
-        # 3. 脚本：点击按钮 -> 提取隐藏 div 的 html -> 写入 clipboard
-        
+        # 这里的 HTML 包含了 Base64 图片
+        # 我们用 JS 将其写入 Clipboard
         components.html(f"""
+        <!DOCTYPE html>
         <html>
         <head>
-            <style>
-                .copy-btn {{
-                    background-color: #4CAF50; border: none; color: white; 
-                    padding: 15px 32px; text-align: center; text-decoration: none;
-                    display: inline-block; font-size: 16px; margin: 4px 2px; 
-                    cursor: pointer; border-radius: 8px; font-weight: bold;
-                    box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-                }}
-                .copy-btn:active {{ background-color: #3e8e41; transform: translateY(2px); }}
-                .status {{ margin-left: 10px; color: #666; font-family: sans-serif; }}
-            </style>
+            <meta charset="UTF-8">
         </head>
-        <body>
-            <!-- 按钮 -->
-            <button class="copy-btn" onclick="copyToClipboard()">📋 点击一键复制到 Word/微信</button>
-            <span id="status" class="status"></span>
+        <body style="margin:0; padding:0; font-family: sans-serif;">
+            
+            <button onclick="doCopy()" style="
+                background-color: #00C853; color: white; border: none; padding: 15px; 
+                width: 100%; font-size: 18px; font-weight: bold; border-radius: 8px; 
+                cursor: pointer; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
+                📋 点击这里：一键复制所有内容 (含图片)
+            </button>
+            
+            <div id="status" style="margin-top:10px; text-align:center; color:#555;"></div>
 
-            <!-- 这里是真正的内容，包含Base64图片 -->
-            <div id="content" style="border:1px solid #eee; padding:20px; margin-top:10px; border-radius:5px; background:white;">
-                {curr['html']}
+            <!-- 可视化区域 -->
+            <div id="doc-content" style="
+                border: 1px solid #e0e0e0; 
+                padding: 40px; 
+                margin-top: 20px; 
+                background: white; 
+                box-shadow: 0 0 15px rgba(0,0,0,0.05);
+                border-radius: 4px;">
+                {html_content}
             </div>
 
             <script>
-                async function copyToClipboard() {{
-                    const node = document.getElementById('content');
+                async function doCopy() {{
+                    const node = document.getElementById('doc-content');
                     const status = document.getElementById('status');
                     
                     try {{
-                        // 创建 Blob 对象，类型为 text/html
-                        // 包含 Base64 图片的 HTML 需要作为 rich text 写入
-                        const htmlContent = node.innerHTML;
-                        const blobHtml = new Blob([htmlContent], {{ type: 'text/html' }});
-                        const blobText = new Blob([node.innerText], {{ type: 'text/plain' }});
+                        // 构建 ClipboardItem
+                        // 必须同时提供 text/html 和 text/plain
+                        const htmlBlob = new Blob([node.innerHTML], {{type: 'text/html'}});
+                        const textBlob = new Blob([node.innerText], {{type: 'text/plain'}});
                         
-                        const data = [new ClipboardItem({{ 
-                            'text/html': blobHtml,
-                            'text/plain': blobText 
-                        }})];
+                        const item = new ClipboardItem({{
+                            'text/html': htmlBlob,
+                            'text/plain': textBlob
+                        }});
                         
-                        await navigator.clipboard.write(data);
+                        await navigator.clipboard.write([item]);
                         
-                        status.innerText = "✅ 已复制！请直接去 Word 粘贴 (Ctrl+V)";
+                        status.innerHTML = "✅ <b>复制成功！</b> 现在去 Word 或 微信 粘贴 (Ctrl+V) 即可看到图片。";
                         status.style.color = "green";
+                        
                     }} catch (err) {{
-                        console.error('Failed to copy: ', err);
-                        status.innerText = "❌ 复制失败 (浏览器限制)。请手动全选下方内容复制。";
+                        console.error(err);
+                        status.innerText = "❌ 自动复制失败 (浏览器限制)。请手动选中下方内容复制。";
                         status.style.color = "red";
                     }}
                 }}
             </script>
         </body>
         </html>
-        """, height=800, scrolling=True)
-
-    with col2:
-        st.subheader("🔥 社媒文案")
-        st.text_area("Social", value=curr['social'], height=800)
+        """, height=1000, scrolling=True)
 
 elif not uploaded_file:
-    st.info("请上传 PDF。本版本内置 JavaScript 剪贴板引擎，生成结果后点击绿色按钮即可完美复制图片和文字。")
+    st.info("Waiting for PDF upload...")
