@@ -6,19 +6,21 @@ import time
 import textwrap
 import pandas as pd
 import matplotlib.pyplot as plt
+import base64
+import re
 from datetime import datetime
 from docx import Document
-from docx.shared import Pt, Inches, RGBColor
+from docx.shared import Pt, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
 
 # --- 全局配置 ---
-st.set_page_config(page_title="Pro Research Agent (Visual Edition)", layout="wide", page_icon="💎")
+st.set_page_config(page_title="Pro Research Agent (Copy Ready)", layout="wide", page_icon="💎")
 
-# 配置绘图风格 (解决中文乱码和样式问题)
+# 绘图配置 (解决中文)
 plt.style.use('ggplot')
 plt.rcParams['font.family'] = 'sans-serif'
-plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial', 'DejaVu Sans', 'Microsoft YaHei'] 
+plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial', 'Microsoft YaHei'] 
 plt.rcParams['axes.unicode_minus'] = False
 
 # --- 状态管理 ---
@@ -27,10 +29,9 @@ if 'history' not in st.session_state:
 if 'current_report' not in st.session_state:
     st.session_state['current_report'] = None
 
-# --- 核心功能函数 ---
+# --- 核心函数 ---
 
 def extract_pages_from_pdf(uploaded_file):
-    """按页提取文本，保证上下文完整"""
     pages_content = []
     with pdfplumber.open(uploaded_file) as pdf:
         for i, page in enumerate(pdf.pages):
@@ -46,47 +47,33 @@ def call_ai_api(api_key, base_url, model_name, messages, temperature=0.1):
         response = requests.post(base_url, headers=headers, json=payload, timeout=300)
         if response.status_code == 200:
             return response.json()['choices'][0]['message']['content']
-        else:
-            print(f"⚠️ API Error: {response.status_code}")
-            return None 
-    except Exception as e:
-        print(f"⚠️ Connection Error: {e}")
+        return None 
+    except Exception:
         return None
 
-def create_professional_table_image(markdown_table_lines):
+def create_table_image_bytes(markdown_table_lines):
     """
-    【高容错表格绘图引擎】
-    将 Markdown 表格文本转化为 Matplotlib 图片对象 (BytesIO)
+    生成表格图片，返回 BytesIO 对象
     """
     try:
-        # 1. 预处理：清洗数据
         clean_rows = []
         for line in markdown_table_lines:
             content = line.strip()
-            # 必须包含 | 且不仅仅是分割线
             if '|' in content:
-                # 移除 Markdown 的分割线行 (例如 |---|---|)
                 clean_check = content.replace('|', '').replace('-', '').replace(':', '').strip()
                 if clean_check: 
                     clean_rows.append(content)
         
-        if len(clean_rows) < 2: return None # 至少要有表头和一行数据
+        if len(clean_rows) < 2: return None
         
-        # 2. 智能解析：按 | 分割
         data_matrix = []
         max_cols = 0
-        
         for line in clean_rows:
-            # 移除首尾可能多余的 |
-            line_pure = line.strip()
-            if line_pure.startswith('|'): line_pure = line_pure[1:]
-            if line_pure.endswith('|'): line_pure = line_pure[:-1]
-            
+            line_pure = line.strip().strip('|')
             cells = [c.strip() for c in line_pure.split('|')]
             data_matrix.append(cells)
             if len(cells) > max_cols: max_cols = len(cells)
 
-        # 3. 补齐列数（防止不规则表格报错）
         final_data = []
         for row in data_matrix:
             if len(row) < max_cols:
@@ -95,124 +82,113 @@ def create_professional_table_image(markdown_table_lines):
             
         if not final_data: return None
 
-        # 4. 转换为 DataFrame
         headers = final_data[0]
         body = final_data[1:]
-        if not body: body = [[""] * len(headers)] # 防止只有表头
+        if not body: body = [[""] * len(headers)]
         
         df = pd.DataFrame(body, columns=headers)
 
-        # 5. 绘图计算
-        # 动态计算高度：根据内容字数决定行高
+        # 绘图逻辑
         row_heights = []
         col_width_chars = 20
         for row in body:
             max_lines = 1
             for cell in row:
-                # 粗略估算换行行数
                 lines = len(textwrap.wrap(str(cell), width=col_width_chars))
                 if lines > max_lines: max_lines = lines
             row_heights.append(max_lines)
             
         base_h = 0.5
-        total_h = 0.8 + sum([rh * base_h for rh in row_heights]) # 表头 + 内容
-        total_w = min(len(headers) * 3.0, 12) # 宽度自适应
+        total_h = 0.8 + sum([rh * base_h for rh in row_heights])
+        total_w = min(len(headers) * 3.0, 12)
 
         fig, ax = plt.subplots(figsize=(total_w, total_h))
         ax.axis('off')
         
-        # 绘制表格
         table = ax.table(cellText=df.values, colLabels=df.columns, loc='center', cellLoc='left')
-        
         table.auto_set_font_size(False)
         table.set_fontsize(11)
         
-        # 样式美化
         cells = table.get_celld()
         for (row, col), cell in cells.items():
             cell.set_edgecolor('#bfbfbf')
             cell.set_linewidth(1)
-            # 设置内边距
             cell.set_text_props(position=(0.02, cell.get_text_props()['position'][1])) 
             
             if row == 0:
                 cell.set_height(0.8 / total_h)
-                cell.set_facecolor('#2c3e50') # 深蓝色表头
+                cell.set_facecolor('#2c3e50')
                 cell.set_text_props(color='white', weight='bold', ha='center', fontsize=12)
             else:
                 rh_mult = row_heights[row-1]
                 cell.set_height((rh_mult * base_h) / total_h)
-                cell.set_facecolor('#f8f9fa' if row % 2 else '#ffffff') # 斑马纹
+                cell.set_facecolor('#f8f9fa' if row % 2 else '#ffffff')
                 cell.set_text_props(color='#333333', wrap=True, ha='left', va='center')
 
         img_buffer = io.BytesIO()
-        plt.savefig(img_buffer, format='png', bbox_inches='tight', dpi=300, pad_inches=0.1)
+        plt.savefig(img_buffer, format='png', bbox_inches='tight', dpi=150, pad_inches=0.1)
         plt.close(fig)
         img_buffer.seek(0)
         return img_buffer
-
-    except Exception as e:
-        print(f"Table Gen Error: {e}")
+    except Exception:
         return None
 
-def parse_content_with_images(text_content):
+def parse_blocks(text_content):
     """
-    【核心转换器】
-    将纯文本拆分为结构化列表：[TextBlock, ImageBlock, TextBlock...]
-    这解决了 UI 和 Word 无法同时渲染图文的问题。
+    将文本解析为 Block 列表，同时处理图片 Base64 编码以便 HTML 使用
     """
     lines = text_content.split('\n')
-    parsed_blocks = [] # List of {'type': 'text'/'image', 'content': str/bytes}
+    blocks = [] 
     
-    current_text_buffer = []
+    current_text = []
     table_buffer = []
     inside_table = False
     
     for line in lines:
         stripped = line.strip()
-        # 判定表格行：包含竖线，且长度大于3（排除干扰字符）
-        is_potential_table_row = '|' in stripped and len(stripped) > 3
+        is_table_row = '|' in stripped and len(stripped) > 3
         
-        if is_potential_table_row:
+        if is_table_row:
             if not inside_table:
-                # 刚进入表格，先把之前的文本存入 Block
-                if current_text_buffer:
-                    parsed_blocks.append({'type': 'text', 'content': "\n".join(current_text_buffer)})
-                    current_text_buffer = []
+                if current_text:
+                    blocks.append({'type': 'text', 'content': "\n".join(current_text)})
+                    current_text = []
                 inside_table = True
             table_buffer.append(stripped)
         else:
             if inside_table:
-                # 表格结束，立即生成图片 Block
-                img_bytes = create_professional_table_image(table_buffer)
+                # 生成表格图片
+                img_bytes = create_table_image_bytes(table_buffer)
                 if img_bytes:
-                    parsed_blocks.append({'type': 'image', 'content': img_bytes})
+                    # 关键：转为 Base64 字符串
+                    b64_str = base64.b64encode(img_bytes.getvalue()).decode()
+                    blocks.append({
+                        'type': 'image', 
+                        'bytes': img_bytes,   # 给 Word 用
+                        'base64': b64_str     # 给 HTML 用
+                    })
                 else:
-                    # 如果生成失败（比如不是真表格），回退为文本
-                    current_text_buffer.extend(table_buffer)
+                    current_text.extend(table_buffer)
                 
                 inside_table = False
                 table_buffer = []
                 
-            current_text_buffer.append(line)
+            current_text.append(line)
             
-    # 处理文档末尾的残留
     if inside_table and table_buffer:
-        img_bytes = create_professional_table_image(table_buffer)
+        img_bytes = create_table_image_bytes(table_buffer)
         if img_bytes:
-            parsed_blocks.append({'type': 'image', 'content': img_bytes})
+            b64_str = base64.b64encode(img_bytes.getvalue()).decode()
+            blocks.append({'type': 'image', 'bytes': img_bytes, 'base64': b64_str})
         else:
-            current_text_buffer.extend(table_buffer)
+            current_text.extend(table_buffer)
             
-    if current_text_buffer:
-        parsed_blocks.append({'type': 'text', 'content': "\n".join(current_text_buffer)})
+    if current_text:
+        blocks.append({'type': 'text', 'content': "\n".join(current_text)})
         
-    return parsed_blocks
+    return blocks
 
-def generate_mixed_word(parsed_blocks):
-    """
-    根据 Block 列表生成 Word，确保图文混排
-    """
+def generate_word(blocks):
     doc = Document()
     style = doc.styles['Normal']
     font = style.font
@@ -220,39 +196,71 @@ def generate_mixed_word(parsed_blocks):
     font.size = Pt(11)
     style.element.rPr.rFonts.set(qn('w:eastAsia'), 'SimHei')
     
-    # 头部
-    doc.add_heading('Investment Research Report', 0).alignment = WD_ALIGN_PARAGRAPH.CENTER
-    doc.add_paragraph(f"Generated by AI | {datetime.now().strftime('%Y-%m-%d')}", style='Normal').alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    doc.add_heading('Research Report', 0).alignment = WD_ALIGN_PARAGRAPH.CENTER
     doc.add_paragraph("_" * 50)
 
-    for block in parsed_blocks:
+    for block in blocks:
         if block['type'] == 'text':
-            # 处理文本中的标题格式
             for line in block['content'].split('\n'):
-                s_line = line.strip()
-                if not s_line: continue
-                if s_line.startswith('# '): doc.add_heading(s_line[2:], 1)
-                elif s_line.startswith('## '): doc.add_heading(s_line[3:], 2)
-                elif s_line.startswith('### '): doc.add_heading(s_line[4:], 3)
-                elif s_line.startswith('- ') or s_line.startswith('* '): doc.add_paragraph(s_line[2:], style='List Bullet')
-                else: doc.add_paragraph(s_line)
-                
+                s = line.strip()
+                if not s: continue
+                if s.startswith('# '): doc.add_heading(s[2:], 1)
+                elif s.startswith('## '): doc.add_heading(s[3:], 2)
+                elif s.startswith('### '): doc.add_heading(s[4:], 3)
+                elif s.startswith('- '): doc.add_paragraph(s[2:], style='List Bullet')
+                else: doc.add_paragraph(s)
         elif block['type'] == 'image':
-            # 插入图片
             p = doc.add_paragraph()
             p.alignment = WD_ALIGN_PARAGRAPH.CENTER
             run = p.add_run()
             try:
-                block['content'].seek(0)
-                run.add_picture(block['content'], width=Inches(6.2))
-            except Exception:
-                p.add_run("[Image Generation Error]")
+                block['bytes'].seek(0) # 关键：重置指针
+                run.add_picture(block['bytes'], width=Inches(6.0))
+            except: pass
 
     bio = io.BytesIO()
     doc.save(bio)
     return bio
 
-# --- UI 侧边栏 ---
+def generate_copyable_html(blocks):
+    """
+    生成一个包含嵌入式 Base64 图片的纯 HTML 字符串。
+    这种格式可以被直接复制到 Email、Word、Notion 中而图片不丢失。
+    """
+    html = """
+    <div id="copy-target" style="font-family: Arial, sans-serif; line-height: 1.6; color: #333; background-color: white; padding: 20px;">
+    """
+    
+    for block in blocks:
+        if block['type'] == 'text':
+            # 简单的 Markdown 转 HTML
+            text = block['content']
+            # 转义 HTML 字符
+            text = text.replace("<", "&lt;").replace(">", "&gt;")
+            
+            lines = text.split('\n')
+            for line in lines:
+                s = line.strip()
+                if not s: continue
+                if s.startswith('### '): html += f"<h3 style='color:#2c3e50; margin-top:15px;'>{s[4:]}</h3>"
+                elif s.startswith('## '): html += f"<h2 style='color:#2c3e50; border-bottom:1px solid #eee; padding-bottom:5px;'>{s[3:]}</h2>"
+                elif s.startswith('# '): html += f"<h1 style='color:#2c3e50;'>{s[2:]}</h1>"
+                elif s.startswith('- ') or s.startswith('* '): html += f"<li style='margin-left:20px;'>{s[2:]}</li>"
+                else: html += f"<p style='margin-bottom:10px;'>{s}</p>"
+                
+        elif block['type'] == 'image':
+            # 使用 Base64 直接嵌入图片
+            b64 = block['base64']
+            html += f"""
+            <div style="text-align: center; margin: 20px 0;">
+                <img src="data:image/png;base64,{b64}" style="max-width: 100%; border: 1px solid #ddd; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+            </div>
+            """
+            
+    html += "</div>"
+    return html
+
+# --- UI ---
 with st.sidebar:
     st.title("🗃️ 历史记录")
     if st.session_state['history']:
@@ -264,108 +272,89 @@ with st.sidebar:
     api_key = st.text_input("API Key", value="sk-3UIO8MwTblfyQuEZz2WUCzQOuK4QwwIPALVcNxFFNUxJayu7", type="password")
     model_name = st.selectbox("Model", ["gemini-3-pro", "gpt-4o", "qwen-max"])
 
-# --- 主界面 ---
-st.title("💎 Pro Research Agent (Visual & Word Perfect)")
+st.title("💎 Pro Research Agent (Visual Copy Ready)")
 
-uploaded_file = st.file_uploader("上传 PDF 资料", type=['pdf'])
+uploaded_file = st.file_uploader("上传 PDF", type=['pdf'])
 
-if uploaded_file and st.button("🔥 开始完美转化"):
+if uploaded_file and st.button("🔥 开始"):
     api_url = "https://api.nuwaapi.com/v1/chat/completions"
     
-    # 1. 解析 PDF
-    with st.spinner("📖 逐页读取 PDF..."):
-        pages_list = extract_pages_from_pdf(uploaded_file)
+    with st.spinner("📖 正在 OCR 识别..."):
+        pages = extract_pages_from_pdf(uploaded_file)
 
-    # 2. 1:1 数字化 (Markdown)
     full_text_parts = []
-    progress_bar = st.progress(0)
+    progress = st.progress(0)
     
-    for i, page_text in enumerate(pages_list):
-        # OCR 级 Prompt
-        prompt = """
-        You are an OCR Engine. Goal: EXACT COPY.
-        Rules:
-        1. Output TEXT exactly as seen (Word-for-Word).
-        2. Detect TABLES and format them as Markdown Tables (| Header |... |---|). 
-           - DO NOT OMIT DATA. 
-           - KEEP EVERY ROW.
-        3. No summaries. No intro/outro text.
-        """
-        msg = [{"role": "user", "content": f"{prompt}\n\nCONTENT:\n{page_text}"}]
+    for i, p in enumerate(pages):
+        # 强制 AI 输出 Markdown 表格
+        prompt = "You are an OCR engine. Output exact text. Detect tables and format them as Markdown Tables (| col |...)."
+        msg = [{"role": "user", "content": f"{prompt}\n\n{p}"}]
         res = call_ai_api(api_key, api_url, model_name, msg)
-        
-        if res: full_text_parts.append(res)
-        else: full_text_parts.append(page_text) # Fallback
-        
-        progress_bar.progress((i + 1) / len(pages_list))
+        full_text_parts.append(res if res else p)
+        progress.progress((i+1)/len(pages))
 
-    full_article = "\n\n".join(full_text_parts)
+    full_text = "\n\n".join(full_text_parts)
 
-    # 3. 预处理 (生成图片对象) - 关键步骤
-    with st.spinner("🎨 正在渲染表格图片与可视化视图..."):
-        # 将文本转为 [Text, Image, Text] 的结构
-        parsed_blocks = parse_content_with_images(full_article)
+    with st.spinner("🎨 生成可视化表格与 HTML..."):
+        # 解析文本，生成图片对象
+        blocks = parse_blocks(full_text)
+        # 生成可复制的 HTML 代码
+        html_content = generate_copyable_html(blocks)
+        # 生成 Word
+        word_data = generate_word(blocks)
 
-    # 4. 社媒生成
-    with st.spinner("🧠 撰写社媒文案 (Lead Analyst)..."):
-        social_prompt = """
-        Act as a Lead Analyst. Write social media content (LinkedIn, Twitter, Reddit) based on this report.
-        Focus on: Logic, Catalysts, and Upside.
-        """
-        msg_social = [{"role": "user", "content": f"{social_prompt}\n\nREPORT:\n{full_article[:8000]}"}]
-        social_res = call_ai_api(api_key, api_url, model_name, msg_social, temperature=0.7)
+    with st.spinner("🧠 撰写社媒..."):
+        msg_s = [{"role": "user", "content": f"Act as Lead Analyst. Write social media posts.\n\n{full_text[:8000]}"}]
+        social = call_ai_api(api_key, api_url, model_name, msg_s, temperature=0.7)
 
-    # 5. 生成 Word
-    word_bio = generate_mixed_word(parsed_blocks)
-
-    # 6. 存档
-    report_data = {
+    report = {
         "time": datetime.now().strftime("%H:%M"),
         "filename": uploaded_file.name,
-        "blocks": parsed_blocks, # 存 blocks 用于渲染
-        "social": social_res,
-        "word_data": word_bio.getvalue()
+        "blocks": blocks,
+        "html": html_content,
+        "word": word_data.getvalue(),
+        "social": social
     }
-    st.session_state['current_report'] = report_data
-    st.session_state['history'].append(report_data)
+    st.session_state['current_report'] = report
+    st.session_state['history'].append(report)
     st.rerun()
 
-# --- 结果展示 ---
-current = st.session_state['current_report']
+# --- 结果展示区 ---
+curr = st.session_state['current_report']
 
-if current:
+if curr:
     st.divider()
-    st.markdown(f"## 📊 交付: {current['filename']}")
+    col1, col2 = st.columns([7, 3])
     
-    col1, col2 = st.columns([6, 4])
-    
-    # === 左侧：图文可视化报告 ===
     with col1:
-        st.subheader("📄 1:1 可视化报告 (图文还原)")
-        st.download_button(
-            "💾 下载 Word 报告 (含表格图片)",
-            data=current['word_data'],
-            file_name=f"Report_{current['time']}.docx",
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        )
-        st.markdown("---")
+        st.subheader("📋 一键复制区 (完美保留表格图片)")
         
-        # 使用容器循环渲染 Block
-        container = st.container(height=800, border=True)
-        with container:
-            if 'blocks' in current:
-                for block in current['blocks']:
-                    if block['type'] == 'text':
-                        st.markdown(block['content'])
-                    elif block['type'] == 'image':
-                        # 直接显示图片！
-                        block['content'].seek(0)
-                        st.image(block['content'], use_container_width=True)
+        # 下载 Word (以防万一)
+        st.download_button("📂 下载 Word", curr['word'], "Report.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        
+        st.markdown("""
+        <div style="background-color: #e8f0fe; padding: 15px; border-radius: 5px; border-left: 5px solid #4285f4; margin-bottom: 20px;">
+            <strong>🚀 如何复制：</strong> 
+            <br>下面显示的是一个完整的 HTML 页面。
+            <br>请在下方白色区域内 <strong>全选 (Ctrl + A)</strong> -> <strong>复制 (Ctrl + C)</strong>。
+            <br>然后直接粘贴到 Word、邮件或微信中，<strong>表格图片会完美保留！</strong>
+        </div>
+        """, unsafe_allow_html=True)
 
-    # === 右侧：社媒文案 ===
+        # --- 核心：渲染包含 Base64 图片的 HTML ---
+        # 这是一个 iframe 或者 div，里面的图片是内嵌的，不是链接
+        html_view = curr['html']
+        
+        # 我们使用一个带边框的容器来包裹这个 HTML，模拟一张“纸”
+        st.markdown(f"""
+        <div style="border: 1px solid #ddd; padding: 40px; border-radius: 2px; background: white; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
+            {html_view}
+        </div>
+        """, unsafe_allow_html=True)
+
     with col2:
-        st.subheader("🔥 深度社媒文案")
-        st.text_area("Social Media Copy", value=current.get('social', ''), height=800)
+        st.subheader("🔥 社媒文案")
+        st.text_area("Social Media", value=curr['social'], height=800)
 
 elif not uploaded_file:
-    st.info("👈 请上传 PDF。系统将生成【包含真实表格图片】的 Word 报告，并在网页左侧直接显示图文效果。")
+    st.info("请上传文件。系统将生成【内嵌 Base64 图片】的 HTML 视图，支持直接复制粘贴。")
